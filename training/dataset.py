@@ -1,4 +1,6 @@
-# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# Copyright (c) SenseTime Research. All rights reserved.
+
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
 # and proprietary rights in and to this software, related documentation
@@ -15,6 +17,9 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+from petrel_client.client import Client
+import cv2
+
 
 try:
     import pyspng
@@ -31,12 +36,16 @@ class Dataset(torch.utils.data.Dataset):
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
         xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 0,        # Random seed to use when applying max_size.
+        square      = False,
     ):
+        print('Inside Dataset')
         self._name = name
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
+        self._square = square
+        print("inside dataset, _square: ", self._square)
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -125,7 +134,10 @@ class Dataset(torch.utils.data.Dataset):
     @property
     def resolution(self):
         assert len(self.image_shape) == 3 # CHW
-        assert self.image_shape[1] == self.image_shape[2]
+        if self._square:
+            assert self.image_shape[1] == self.image_shape[2]
+        else:
+            assert self.image_shape[1] == self.image_shape[2] * 2
         return self.image_shape[1]
 
     @property
@@ -157,10 +169,13 @@ class ImageFolderDataset(Dataset):
     def __init__(self,
         path,                   # Path to directory or zip.
         resolution      = None, # Ensure specific resolution, None = highest available.
+        ceph            = False,
+        square          = False,
         **super_kwargs,         # Additional arguments for the Dataset base class.
     ):
-        self._path = path
+        self._path = path 
         self._zipfile = None
+        self._square = square
 
         if os.path.isdir(self._path):
             self._type = 'dir'
@@ -178,9 +193,16 @@ class ImageFolderDataset(Dataset):
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
-        if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
-            raise IOError('Image files do not match the specified resolution')
-        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+        # if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
+            # raise IOError('Image files do not match the specified resolution')
+        if resolution is not None:
+            if self._square: 
+                raw_shape[2] = raw_shape[3]   = resolution  
+            else:
+                raw_shape[2] = resolution      
+                raw_shape[3] = resolution // 2 
+            # print(raw_shape)
+        super().__init__(name=name, raw_shape=raw_shape,square=square, **super_kwargs)
 
     @staticmethod
     def _file_ext(fname):

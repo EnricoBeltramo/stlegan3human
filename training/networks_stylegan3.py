@@ -1,3 +1,5 @@
+# Copyright (c) SenseTime Research. All rights reserved.
+
 # Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -173,11 +175,16 @@ class SynthesisInput(torch.nn.Module):
         size,           # Output spatial size: int or [width, height].
         sampling_rate,  # Output sampling rate.
         bandwidth,      # Output bandwidth.
+        square,
     ):
         super().__init__()
         self.w_dim = w_dim
         self.channels = channels
-        self.size = np.broadcast_to(np.asarray(size), [2])
+        self.square = square
+        if self.square:
+            self.size = np.broadcast_to(np.asarray(size), [2])
+        else:
+            self.size = np.array([size // 2, size]) # [width, height]
         self.sampling_rate = sampling_rate
         self.bandwidth = bandwidth
 
@@ -276,6 +283,7 @@ class SynthesisLayer(torch.nn.Module):
         use_radial_filters  = False,    # Use radially symmetric downsampling filter? Ignored for critically sampled layers.
         conv_clamp          = 256,      # Clamp the output to [-X, +X], None = disable clamping.
         magnitude_ema_beta  = 0.999,    # Decay rate for the moving average of input magnitudes.
+        square              = False,    # default if for rectangle images
     ):
         super().__init__()
         self.w_dim = w_dim
@@ -284,8 +292,15 @@ class SynthesisLayer(torch.nn.Module):
         self.use_fp16 = use_fp16
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.in_size = np.broadcast_to(np.asarray(in_size), [2])
-        self.out_size = np.broadcast_to(np.asarray(out_size), [2])
+        self.square = square
+        if self.square:  
+            self.in_size = np.broadcast_to(np.asarray(in_size), [2])
+            self.out_size = np.broadcast_to(np.asarray(out_size), [2])
+        else:
+            # self.in_size = np.array[in_size, in_size//2]
+            self.in_size = np.array([in_size // 2, in_size])
+            # self.out_size = np.array[out_size, out_size//2]
+            self.out_size = np.array([out_size // 2, out_size])
         self.in_sampling_rate = in_sampling_rate
         self.out_sampling_rate = out_sampling_rate
         self.tmp_sampling_rate = max(in_sampling_rate, out_sampling_rate) * (1 if is_torgb else lrelu_upsampling)
@@ -401,6 +416,7 @@ class SynthesisNetwork(torch.nn.Module):
         w_dim,                          # Intermediate latent (W) dimensionality.
         img_resolution,                 # Output image resolution.
         img_channels,                   # Number of color channels.
+        square,
         channel_base        = 32768,    # Overall multiplier for the number of channels.
         channel_max         = 512,      # Maximum number of channels in any layer.
         num_layers          = 14,       # Total number of layers, excluding Fourier features and ToRGB.
@@ -412,6 +428,7 @@ class SynthesisNetwork(torch.nn.Module):
         output_scale        = 0.25,     # Scale factor for the output image.
         num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
         **layer_kwargs,                 # Arguments for SynthesisLayer.
+        
     ):
         super().__init__()
         self.w_dim = w_dim
@@ -423,6 +440,7 @@ class SynthesisNetwork(torch.nn.Module):
         self.margin_size = margin_size
         self.output_scale = output_scale
         self.num_fp16_res = num_fp16_res
+        self.square = square
 
         # Geometric progression of layer cutoffs and min. stopbands.
         last_cutoff = self.img_resolution / 2 # f_{c,N}
@@ -442,7 +460,7 @@ class SynthesisNetwork(torch.nn.Module):
         # Construct layers.
         self.input = SynthesisInput(
             w_dim=self.w_dim, channels=int(channels[0]), size=int(sizes[0]),
-            sampling_rate=sampling_rates[0], bandwidth=cutoffs[0])
+            sampling_rate=sampling_rates[0], bandwidth=cutoffs[0], square=self.square)
         self.layer_names = []
         for idx in range(self.num_layers + 1):
             prev = max(idx - 1, 0)
@@ -456,6 +474,7 @@ class SynthesisNetwork(torch.nn.Module):
                 in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]),
                 in_cutoff=cutoffs[prev], out_cutoff=cutoffs[idx],
                 in_half_width=half_widths[prev], out_half_width=half_widths[idx],
+                square=self.square,
                 **layer_kwargs)
             name = f'L{idx}_{layer.out_size[0]}_{layer.out_channels}'
             setattr(self, name, layer)
@@ -473,7 +492,10 @@ class SynthesisNetwork(torch.nn.Module):
             x = x * self.output_scale
 
         # Ensure correct shape and dtype.
-        misc.assert_shape(x, [None, self.img_channels, self.img_resolution, self.img_resolution])
+        if self.square:
+            misc.assert_shape(x, [None, self.img_channels, self.img_resolution, self.img_resolution])
+        else:
+            misc.assert_shape(x, [None, self.img_channels, self.img_resolution, self.img_resolution // 2])
         x = x.to(torch.float32)
         return x
 
@@ -493,6 +515,7 @@ class Generator(torch.nn.Module):
         c_dim,                      # Conditioning label (C) dimensionality.
         w_dim,                      # Intermediate latent (W) dimensionality.
         img_resolution,             # Output resolution.
+        square,
         img_channels,               # Number of output color channels.
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         **synthesis_kwargs,         # Arguments for SynthesisNetwork.
@@ -503,7 +526,8 @@ class Generator(torch.nn.Module):
         self.w_dim = w_dim
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.square = square
+        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, square=self.square, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
